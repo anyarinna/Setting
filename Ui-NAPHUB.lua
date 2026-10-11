@@ -1221,7 +1221,7 @@ local SEASON_CFG = {
     CoinFarmTimeout = 600,
 }
 
-local SeasonState = { InTower = false, Entering = false, Busy = false, TowerLoot = 0 }
+local SeasonState = { InTower = false, Entering = false, Busy = false, Farming = false, Gen = 0, TargetReached = false, TowerLoot = 0 }
 local Backend = {}
 
 -- หา Instance ตาม path เช่น "Config.Dungeon.Config.LootTab"
@@ -1378,40 +1378,111 @@ function Backend.TowerExit()
     pcall(function() getRemote("Dungeon", "ExitDungeonRE"):FireServer() end)
 end
 
-function Backend.TowerFarmStep()
-    if not Backend.TowerEnter() then return false end
+---@param gen number  รุ่นของการฟาร์ม (ใช้หยุดเมื่อปิดสวิตช์)
+---@param maxCalls number  จำนวนครั้งสูงสุดที่ยิง CompleteRoundRF รอบนี้
+---@return boolean, number  เข้าหอคอยได้ไหม, จำนวนครั้งที่สำเร็จ
+function Backend.TowerFarmStep(gen, maxCalls)
+    if not Backend.TowerEnter() then return false, 0 end
     local round = Backend.TowerLastRound()
     local start = getRemote("Dungeon", "StartRoundRE")
     local complete = getRemote("Dungeon", "CompleteRoundRF")
+    local limit = SEASON_CFG.TowerWorkers * SEASON_CFG.TowerCallsPerWorker
+    local left = math.clamp(math.floor(maxCalls or limit), 1, limit)
+    local success = 0
     start:FireServer(round)
-    waitAll(SEASON_CFG.TowerWorkers, function()
-        for _ = 1, SEASON_CFG.TowerCallsPerWorker do
-            if complete:InvokeServer(round) then SeasonState.TowerLoot += 1 end
+    waitAll(math.min(SEASON_CFG.TowerWorkers, left), function()
+        while left > 0 do
+            -- ถูกปิดสวิตช์แล้ว ให้หยุดทันที
+            if not SeasonState.Farming or SeasonState.Gen ~= gen or SeasonState.TargetReached then break end
+            left -= 1 -- จองสิทธิ์ก่อนยิง จึงไม่เกินจำนวนที่กำหนด
+            if complete:InvokeServer(round) then
+                success += 1
+                SeasonState.TowerLoot += 1
+            end
         end
+    end)
+    return true, success
+end
+
+---@param target number  เป้าหมายเหรียญซีซั่น (ครบแล้วปิดเอง)
+---@param onProgress function?  ส่ง (gained, target) ทุกรอบ
+---@param onStop function?  ส่ง (gained, reason) เมื่อจบ: "done" | "ticket" | "manual" | "error" | "replaced"
+---@return boolean  false ถ้ากำลังฟาร์มอยู่แล้ว
+function Backend.StartSeasonFarm(target, onProgress, onStop)
+    if SeasonState.Farming then return false end
+    SeasonState.Farming = true
+    SeasonState.Gen += 1
+    local gen = SeasonState.Gen
+
+    task.spawn(function()
+        local reason, gained, startCoins = "manual", 0, 0
+        local ok, err = pcall(function()
+            startCoins = Backend.SeasonCoins()
+            SeasonState.TargetReached = false
+            local maxCalls = SEASON_CFG.TowerWorkers * SEASON_CFG.TowerCallsPerWorker
+            local calls = 4       -- รอบแรกยิงน้อยๆ เพื่อวัดว่าได้เหรียญต่อครั้งเท่าไร
+            local perCall = nil   -- เหรียญที่ได้ต่อการยิง 1 ครั้ง (วัดจากรอบก่อนหน้า)
+            while SeasonState.Farming and SeasonState.Gen == gen do
+                if not SeasonState.InTower and Backend.CountItem(Backend.GetProfile(), "Dungeon_Ticket") < 1 then
+                    reason = "ticket"
+                    break
+                end
+                local before = Backend.SeasonCoins()
+                -- ตัวเฝ้า: เช็กเหรียญทุก ~0.1 วิ ถึงเป้าเมื่อไรสั่งหยุดยิงและออกจากดันเจี้ยนทันที
+                local watching = true
+                task.spawn(function()
+                    while watching and SeasonState.Farming and SeasonState.Gen == gen do
+                        local okCoins, coins = pcall(Backend.SeasonCoins)
+                        if okCoins and coins - startCoins >= target then
+                            SeasonState.TargetReached = true
+                            Backend.TowerExit()
+                            break
+                        end
+                        task.wait(0.1)
+                    end
+                end)
+                local entered, success = Backend.TowerFarmStep(gen, calls)
+                watching = false
+                if not entered then
+                    reason = "ticket"
+                    break
+                end
+                local now = Backend.SeasonCoins()
+                gained = now - startCoins
+                if onProgress then onProgress(gained, target) end
+                if gained >= target or SeasonState.TargetReached then
+                    reason = "done"
+                    break
+                end
+
+                -- คำนวณจำนวนครั้งที่ต้องยิงรอบถัดไปให้ได้ใกล้เป้าหมายพอดี ไม่เกิน
+                if success > 0 and now > before then
+                    perCall = (now - before) / success
+                end
+                if perCall then
+                    calls = math.clamp(math.ceil((target - gained) / perCall * 0.9), 1, maxCalls)
+                else
+                    calls = math.min(calls * 4, maxCalls) -- ยังไม่เห็นเหรียญเพิ่ม ค่อยๆ เพิ่มจำนวน
+                end
+            end
+        end)
+        if not ok then reason, gained = "error", err end
+
+        if SeasonState.Gen == gen then
+            SeasonState.Farming = false
+            Backend.TowerExit() -- จบดันเจี้ยน
+        else
+            reason = "replaced"
+        end
+        if onStop then onStop(gained, reason) end
     end)
     return true
 end
 
----@param target number  จำนวนเหรียญซีซั่นที่ต้องการ
----@param onProgress function?  เรียกทุกรอบ ส่งจำนวนที่ได้แล้ว
----@return number  เหรียญซีซั่นที่ได้จริง
-function Backend.FarmSeasonCoins(target, onProgress)
-    local start = Backend.SeasonCoins()
-    local deadline = os.clock() + SEASON_CFG.CoinFarmTimeout
-    local gained = 0
-    local ok, err = pcall(function()
-        while gained < target and os.clock() < deadline do
-            if not SeasonState.InTower and Backend.CountItem(Backend.GetProfile(), "Dungeon_Ticket") < 1 then
-                break -- ตั๋วหมด
-            end
-            if not Backend.TowerFarmStep() then break end
-            gained = Backend.SeasonCoins() - start
-            if onProgress then onProgress(gained) end
-        end
-    end)
+-- ปิดสวิตช์: หยุดฟาร์มและออกจากดันเจี้ยนทันที
+function Backend.StopSeasonFarm()
+    SeasonState.Farming = false
     Backend.TowerExit()
-    if not ok then error(err, 0) end
-    return gained
 end
 
 ---------------------------------------------------------------------
@@ -1612,6 +1683,61 @@ local function makeSection(title, withOP, order, startOpen)
     return body
 end
 
+local function makeToggle(parent, text, order, onChange)
+    local row = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = Color3.fromRGB(24, 24, 27),
+        Text = "",
+        AutoButtonColor = false,
+        LayoutOrder = order,
+    }, parent)
+    corner(row, 8)
+    stroke(row, 1.5, Color3.fromRGB(12, 12, 14))
+    new("TextLabel", {
+        Size = UDim2.new(1, -66, 1, 0),
+        Position = UDim2.fromOffset(10, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = Color3.fromRGB(240, 241, 245),
+        TextSize = 14,
+        Font = Enum.Font.GothamMedium,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true,
+    }, row)
+    local track = new("Frame", {
+        Size = UDim2.fromOffset(44, 22),
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -10, 0.5, 0),
+        BackgroundColor3 = Color3.fromRGB(70, 72, 78),
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 11)
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(18, 18),
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 2, 0.5, 0),
+        BackgroundColor3 = Color3.fromRGB(235, 236, 240),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 9)
+
+    local state = false
+    local function set(value)
+        state = value
+        TweenService:Create(track, TweenInfo.new(0.12), {
+            BackgroundColor3 = value and Color3.fromRGB(66, 142, 200) or Color3.fromRGB(70, 72, 78),
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.12), {
+            Position = value and UDim2.new(1, -20, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        }):Play()
+    end
+    row.MouseButton1Click:Connect(function()
+        set(not state)
+        onChange(state)
+    end)
+    return set
+end
+
 -- แปลงข้อความเป็นตัวเลข รองรับ 1,000,000 / 500k / 2m
 local function parseAmount(text)
     text = tostring(text or ""):lower():gsub("[%s,]", "")
@@ -1654,20 +1780,6 @@ corner(AmountBox, 8)
 stroke(AmountBox, 1.5, Color3.fromRGB(12, 12, 14))
 new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, AmountBox)
 
-local CoinBtn = new("TextButton", {
-    Name = "AddSeasonCoins",
-    Size = UDim2.new(1, 0, 0, 38),
-    BackgroundColor3 = Color3.fromRGB(66, 142, 200),
-    Text = "เพิ่มเหรียญซีซั่น",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 16,
-    Font = Enum.Font.GothamMedium,
-    AutoButtonColor = true,
-    LayoutOrder = 3,
-}, SeasonBody)
-corner(CoinBtn, 8)
-stroke(CoinBtn, 2, Color3.fromRGB(12, 12, 14))
-
 local CoinStatus = new("TextLabel", {
     Name = "CoinStatus",
     Size = UDim2.new(1, 0, 0, 0),
@@ -1689,36 +1801,38 @@ local function setStatus(text, color)
     CoinStatus.Visible = text ~= ""
 end
 
-CoinBtn.MouseButton1Click:Connect(function()
-    if SeasonState.Busy then return end
-    local amount = parseAmount(AmountBox.Text)
-    if not amount then
-        return setStatus("กรอกจำนวนเป็นตัวเลขก่อน เช่น 1000000", Color3.fromRGB(235, 130, 120))
-    end
-
-    SeasonState.Busy = true
-    CoinBtn.Text = "กำลังฟาร์ม..."
-    CoinBtn.BackgroundColor3 = Color3.fromRGB(90, 96, 108)
-    setStatus("กำลังฟาร์มเหรียญซีซั่นในหอคอย... อย่าปิดเกม")
-
-    task.spawn(function()
-        local ok, result = pcall(Backend.FarmSeasonCoins, amount, function(gained)
-            setStatus(("กำลังฟาร์ม... ได้แล้ว +%s / %s"):format(abbreviate(gained), abbreviate(amount)))
-        end)
-        if ok then
-            if (result or 0) > 0 then
-                setStatus(("สำเร็จ +%s เหรียญซีซั่น (อยู่ในเกมต่ออีก 1 นาทีเพื่อให้เซฟ)"):format(abbreviate(result)), Color3.fromRGB(130, 220, 150))
-            else
-                setStatus("ไม่ได้เหรียญเพิ่ม: ตั๋วหอคอยอาจหมด หรือเกมอัปเดตแล้ว", Color3.fromRGB(235, 130, 120))
-            end
-        else
-            setStatus("ผิดพลาด: " .. tostring(result), Color3.fromRGB(235, 130, 120))
-            warn("[NAPHUB] SeasonCoins", result)
+local setCoinToggle
+setCoinToggle = makeToggle(SeasonBody, "ฟาร์มเหรียญซีซั่น (เปิด = เข้าดันเจี้ยน / ปิด = จบดันเจี้ยน)", 3, function(on)
+    if on then
+        local amount = parseAmount(AmountBox.Text)
+        if not amount then
+            setCoinToggle(false)
+            return setStatus("กรอกจำนวนเป็นตัวเลขก่อน เช่น 1000000", Color3.fromRGB(235, 130, 120))
         end
-        SeasonState.Busy = false
-        CoinBtn.Text = "เพิ่มเหรียญซีซั่น"
-        CoinBtn.BackgroundColor3 = Color3.fromRGB(66, 142, 200)
-    end)
+        setStatus("เปิดอยู่: กำลังฟาร์มในหอคอย...", Color3.fromRGB(130, 220, 150))
+        local started = Backend.StartSeasonFarm(amount, function(gained, target)
+            setStatus(("เปิดอยู่: ได้แล้ว +%s / %s"):format(abbreviate(gained), abbreviate(target)), Color3.fromRGB(130, 220, 150))
+        end, function(gained, reason)
+            if reason == "replaced" then return end
+            if reason == "manual" then
+                return setStatus(("ปิดแล้ว: ออกจากดันเจี้ยนแล้ว (ได้ +%s)"):format(abbreviate(gained)))
+            end
+            setCoinToggle(false)
+            if reason == "done" then
+                setStatus(("ครบแล้ว +%s เหรียญซีซั่น ออกจากดันเจี้ยนแล้ว (อยู่ในเกมต่ออีก 1 นาทีเพื่อให้เซฟ)"):format(abbreviate(gained)), Color3.fromRGB(130, 220, 150))
+            elseif reason == "ticket" then
+                setStatus(("หยุด: ตั๋วหอคอยหมด หรือเข้าไม่ได้ (ได้ +%s)"):format(abbreviate(gained)), Color3.fromRGB(235, 130, 120))
+            else
+                setStatus("ผิดพลาด: " .. tostring(gained), Color3.fromRGB(235, 130, 120))
+                warn("[NAPHUB] SeasonCoins", gained)
+            end
+        end)
+        if not started then
+            setStatus("กำลังฟาร์มอยู่แล้ว", Color3.fromRGB(235, 130, 120))
+        end
+    else
+        Backend.StopSeasonFarm()
+    end
 end)
 
 ---------------------------------------------------------------------
