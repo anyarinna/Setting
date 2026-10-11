@@ -1494,8 +1494,9 @@ local EMBER_CFG = { StageId = "Stage_27", StoneId = "EnhantStone_1", BatchSize =
 
 ---@param targetAmount number  จำนวนที่ต้องการเพิ่ม
 ---@param onProgress function?  ส่ง (gained, target) ทุกรอบ
----@return number, number  gained, finalCount
-function Backend.PumpEmberStones(targetAmount, onProgress)
+---@param shouldStop function?  คืน true เมื่อต้องการหยุด (ปิดสวิตช์)
+---@return number, number, string  gained, finalCount, reason ("done" | "manual" | "timeout")
+function Backend.PumpEmberStones(targetAmount, onProgress, shouldStop)
     local stageRemote = getRemote("Stage", "StageFinishedRF")
     local stoneRemote = getRemote("Stage", "GetEnhantStoneRE")
     local backpackData = needModule(findPath("LocalData.BackpackData"))
@@ -1532,11 +1533,12 @@ function Backend.PumpEmberStones(targetAmount, onProgress)
     local maxWait = math.max(60, math.ceil(targetAmount / 5000) * 60)
     local batchSize, waitTime, stalls = EMBER_CFG.BatchSize, EMBER_CFG.WaitTime, 0
 
-    while current < goal and (os.clock() - t0) < maxWait do
+    while current < goal and (os.clock() - t0) < maxWait and not (shouldStop and shouldStop()) do
         local before = current
         local n = (goal - current < 50) and math.min(batchSize, 15) or batchSize
         for _ = 1, n do
             task.spawn(function()
+                if shouldStop and shouldStop() then return end
                 local ok, drops = pcall(function() return stageRemote:InvokeServer(EMBER_CFG.StageId) end)
                 if ok then claimDrops(drops) end
             end)
@@ -1563,7 +1565,14 @@ function Backend.PumpEmberStones(targetAmount, onProgress)
         local bpGui = require(ReplicatedStorage.GuiUtils.BackpackGUI)
         if bpGui and bpGui.UpdateBackpack then bpGui.UpdateBackpack() end
     end)
-    return math.max(0, finalCount - initialCount), finalCount
+    local gained = math.max(0, finalCount - initialCount)
+    local reason = "timeout"
+    if shouldStop and shouldStop() then
+        reason = "manual"
+    elseif gained >= targetAmount then
+        reason = "done"
+    end
+    return gained, finalCount, reason
 end
 
 ---------------------------------------------------------------------
@@ -1869,20 +1878,6 @@ corner(EmberAmount, 8)
 stroke(EmberAmount, 1.5, Color3.fromRGB(12, 12, 14))
 new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, EmberAmount)
 
-local EmberBtn = new("TextButton", {
-    Name = "SpawnEmber",
-    Size = UDim2.new(1, 0, 0, 38),
-    BackgroundColor3 = Color3.fromRGB(66, 142, 200),
-    Text = "เสก Ember Stone",
-    TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 16,
-    Font = Enum.Font.GothamMedium,
-    AutoButtonColor = true,
-    LayoutOrder = 3,
-}, EmberBody)
-corner(EmberBtn, 8)
-stroke(EmberBtn, 2, Color3.fromRGB(12, 12, 14))
-
 local EmberStatus = new("TextLabel", {
     Name = "EmberStatus",
     Size = UDim2.new(1, 0, 0, 0),
@@ -1904,36 +1899,57 @@ local function setEmberStatus(text, color)
     EmberStatus.Visible = text ~= ""
 end
 
-EmberBtn.MouseButton1Click:Connect(function()
-    if SeasonState.Busy then
-        return setEmberStatus("มีงานอื่นกำลังทำอยู่ รอให้เสร็จก่อน", Color3.fromRGB(235, 130, 120))
-    end
-    local amount = parseAmount(EmberAmount.Text)
-    if not amount then
-        return setEmberStatus("กรอกจำนวนเป็นตัวเลขก่อน เช่น 50000", Color3.fromRGB(235, 130, 120))
-    end
+local EmberState = { Running = false, Gen = 0 }
 
-    SeasonState.Busy = true
-    EmberBtn.Text = "กำลังเสก..."
-    EmberBtn.BackgroundColor3 = Color3.fromRGB(90, 96, 108)
-    setEmberStatus("กำลังเสก Ember Stone... อย่าปิดเกม")
-
-    task.spawn(function()
-        local ok, gained, finalCount = pcall(Backend.PumpEmberStones, amount, function(done, target)
-            setEmberStatus(("กำลังเสก... +%s / %s"):format(abbreviate(done), abbreviate(target)))
-        end)
-        if ok and gained > 0 then
-            setEmberStatus(("สำเร็จ +%s Ember Stone (รวมในกระเป๋า %s) อยู่ในเกมต่ออีก 1 นาทีเพื่อให้เซฟ"):format(abbreviate(gained), abbreviate(finalCount)), Color3.fromRGB(130, 220, 150))
-        elseif ok then
-            setEmberStatus("ไม่ได้ Ember Stone เพิ่ม: เซิร์ฟเวอร์อาจไม่ตอบ หรือเกมอัปเดตแล้ว", Color3.fromRGB(235, 130, 120))
-        else
-            setEmberStatus("ผิดพลาด: " .. tostring(gained), Color3.fromRGB(235, 130, 120))
-            warn("[NAPHUB] EmberStone", gained)
+local setEmberToggle
+setEmberToggle = makeToggle(EmberBody, "เสก Ember Stone (เปิด = เริ่มเสก / ปิด = หยุด)", 3, function(on)
+    if on then
+        if EmberState.Running then return end
+        local amount = parseAmount(EmberAmount.Text)
+        if not amount then
+            setEmberToggle(false)
+            return setEmberStatus("กรอกจำนวนเป็นตัวเลขก่อน เช่น 50000", Color3.fromRGB(235, 130, 120))
         end
-        SeasonState.Busy = false
-        EmberBtn.Text = "เสก Ember Stone"
-        EmberBtn.BackgroundColor3 = Color3.fromRGB(66, 142, 200)
-    end)
+
+        EmberState.Running = true
+        EmberState.Gen += 1
+        local gen = EmberState.Gen
+        local function stopped()
+            return not EmberState.Running or EmberState.Gen ~= gen
+        end
+        setEmberStatus(("เปิดอยู่: กำลังเสก... +0 / %s"):format(abbreviate(amount)), Color3.fromRGB(130, 220, 150))
+
+        task.spawn(function()
+            local ok, gained, finalCount, reason = pcall(Backend.PumpEmberStones, amount, function(done, target)
+                if not stopped() then
+                    setEmberStatus(("เปิดอยู่: กำลังเสก... +%s / %s"):format(abbreviate(done), abbreviate(target)), Color3.fromRGB(130, 220, 150))
+                end
+            end, stopped)
+
+            if EmberState.Gen ~= gen then return end -- ถูกสั่งเริ่มรอบใหม่แล้ว
+            EmberState.Running = false
+            setEmberToggle(false)
+
+            if not ok then
+                setEmberStatus("ผิดพลาด: " .. tostring(gained), Color3.fromRGB(235, 130, 120))
+                warn("[NAPHUB] EmberStone", gained)
+            elseif reason == "manual" then
+                setEmberStatus(("ปิดแล้ว: หยุดเสก (ได้ +%s)"):format(abbreviate(gained)))
+            elseif gained >= amount then
+                setEmberStatus(("ครบแล้ว +%s Ember Stone (รวมในกระเป๋า %s) ปิดอัตโนมัติ อยู่ในเกมต่ออีก 1 นาทีเพื่อให้เซฟ"):format(abbreviate(gained), abbreviate(finalCount)), Color3.fromRGB(130, 220, 150))
+            elseif gained > 0 then
+                setEmberStatus(("หยุด: หมดเวลา ได้ +%s / %s Ember Stone"):format(abbreviate(gained), abbreviate(amount)), Color3.fromRGB(235, 130, 120))
+            else
+                setEmberStatus("ไม่ได้ Ember Stone เพิ่ม: เซิร์ฟเวอร์อาจไม่ตอบ หรือเกมอัปเดตแล้ว", Color3.fromRGB(235, 130, 120))
+            end
+        end)
+    else
+        -- ปิดสวิตช์: สั่งหยุดทันที (ลูปจะเช็กและจบเอง)
+        if EmberState.Running then
+            EmberState.Running = false
+            setEmberStatus("ปิดแล้ว: กำลังหยุด...")
+        end
+    end
 end)
 
 -- เพชรประดับกลางขอบทั้ง 4 ด้าน (เหมือนโลโก้)
