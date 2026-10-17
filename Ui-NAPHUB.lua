@@ -1216,12 +1216,13 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local SEASON_CFG = {
     RemoteTimeout = 10,
     RequireTimeout = 3,
-    TowerWorkers = 128,
-    TowerCallsPerWorker = 25,
+    TowerRound = 50,          -- รอบที่ยิง (StartRoundRE / CompleteRoundRF)
+    TowerWorkers = 5,         -- จำนวนเธรดยิงพร้อมกัน
+    TowerCallsPerWorker = 200,
     CoinFarmTimeout = 600,
 }
 
-local SeasonState = { InTower = false, Entering = false, Busy = false, Farming = false, Gen = 0, TargetReached = false, TowerLoot = 0 }
+local SeasonState = { Claimed = false, InTower = false, Entering = false, Busy = false, Farming = false, Gen = 0, TargetReached = false, TowerLoot = 0 }
 local Backend = {}
 
 -- หา Instance ตาม path เช่น "Config.Dungeon.Config.LootTab"
@@ -1355,8 +1356,15 @@ function Backend.SeasonCoins()
 end
 
 function Backend.TowerLastRound()
-    local lootTab = findPath("Config.Dungeon.Config.LootTab")
-    return #needModule(lootTab)
+    return SEASON_CFG.TowerRound
+end
+
+-- รับตั๋วหอคอยรายวัน (ยิงครั้งเดียวต่อการฟาร์ม 1 รอบ)
+function Backend.ClaimDailyTicket()
+    if SeasonState.Claimed then return end
+    SeasonState.Claimed = true
+    pcall(function() getRemote("Dungeon", "TryClaimDailyDunTicRE"):FireServer() end)
+    task.wait(0.2)
 end
 
 function Backend.TowerEnter()
@@ -1365,8 +1373,9 @@ function Backend.TowerEnter()
     if SeasonState.InTower then return true end
     SeasonState.Entering = true
     local ok, entered = pcall(function()
-        return getRemote("Dungeon", "TryIntoDungeonRF"):InvokeServer(1)
+        return getRemote("Dungeon", "TryIntoDungeonRF"):InvokeServer(true, SEASON_CFG.TowerRound)
     end)
+    task.wait(0.2)
     SeasonState.Entering = false
     SeasonState.InTower = (ok and entered) and true or false
     return SeasonState.InTower
@@ -1389,16 +1398,20 @@ function Backend.TowerFarmStep(gen, maxCalls)
     local limit = SEASON_CFG.TowerWorkers * SEASON_CFG.TowerCallsPerWorker
     local left = math.clamp(math.floor(maxCalls or limit), 1, limit)
     local success = 0
-    start:FireServer(round)
-    waitAll(math.min(SEASON_CFG.TowerWorkers, left), function()
+    waitAll(SEASON_CFG.TowerWorkers, function()
         while left > 0 do
             -- ถูกปิดสวิตช์แล้ว ให้หยุดทันที
-            if not SeasonState.Farming or SeasonState.Gen ~= gen or SeasonState.TargetReached then break end
+            if not SeasonState.Farming or SeasonState.Gen ~= gen or SeasonState.TargetReached or not SeasonState.InTower then break end
             left -= 1 -- จองสิทธิ์ก่อนยิง จึงไม่เกินจำนวนที่กำหนด
-            if complete:InvokeServer(round) then
-                success += 1
-                SeasonState.TowerLoot += 1
+            start:FireServer(round)
+            local ok, result = pcall(complete.InvokeServer, complete, round)
+            -- เซิร์ฟเวอร์ไม่คืน table = ดันเจี้ยนจบ/ตั๋วหมด ให้หยุดและเข้าใหม่รอบหน้า
+            if not ok or type(result) ~= "table" then
+                SeasonState.InTower = false
+                break
             end
+            success += 1
+            SeasonState.TowerLoot += 1
         end
     end)
     return true, success
@@ -1417,6 +1430,8 @@ function Backend.StartSeasonFarm(target, onProgress, onStop)
     task.spawn(function()
         local reason, gained, startCoins = "manual", 0, 0
         local ok, err = pcall(function()
+            SeasonState.Claimed = false
+            Backend.ClaimDailyTicket()
             startCoins = Backend.SeasonCoins()
             SeasonState.TargetReached = false
             local maxCalls = SEASON_CFG.TowerWorkers * SEASON_CFG.TowerCallsPerWorker
